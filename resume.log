@@ -1,0 +1,21 @@
+等待训练进程结束...
+训练完成，自动续训 30 轮 (目标 80 轮)...
+设备: cuda
+GPU: NVIDIA GeForce RTX 5090
+Dataset: 3449 样本, 41 个面板类别
+面板类别数: 41
+训练: 3105, 验证: 344
+参数量: 376,699
+Traceback (most recent call last):
+  File "/home/ddd/zkl/Baseline2/train.py", line 329, in <module>
+    main()
+  File "/home/ddd/zkl/Baseline2/train.py", line 235, in main
+    ckpt = torch.load(args.resume, map_location=device)
+  File "/home/ddd/anaconda3/envs/dgcnn/lib/python3.9/site-packages/torch/serialization.py", line 1524, in load
+    raise pickle.UnpicklingError(_get_wo_message(str(e))) from None
+_pickle.UnpicklingError: Weights only load failed. This file can still be loaded, to do so you have two options, [1mdo those steps only if you trust the source of the checkpoint[0m. 
+	(1) In PyTorch 2.6, we changed the default value of the `weights_only` argument in `torch.load` from `False` to `True`. Re-running `torch.load` with `weights_only` set to `False` will likely succeed, but it can result in arbitrary code execution. Do it only if you got the file from a trusted source.
+	(2) Alternatively, to load with `weights_only=True` please check the recommended steps in the following error message.
+	WeightsUnpickler error: Unsupported global: GLOBAL numpy._core.multiarray.scalar was not an allowed global by default. Please use `torch.serialization.add_safe_globals([numpy._core.multiarray.scalar])` or the `torch.serialization.safe_globals([numpy._core.multiarray.scalar])` context manager to allowlist this global if you trust this class/function.
+
+Check the documentation of torch.load to learn more about types accepted by default with weights_only https://pytorch.org/docs/stable/generated/torch.load.html.
