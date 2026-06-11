@@ -1,499 +1,304 @@
-"""
-Inference script for NeuralTailor-based garment panel segmentation.
-Predicts panel labels for 3D garment point clouds, then extracts 2D panel boundaries.
+"""Fast inference: seam detection (MLP) → cut panels → unfold (GNN) → visualize.
 
-Outputs:
-  - 3D mesh colored by predicted panel labels
-  - 2D panel layout visualization
-  - Comparison with ground truth pattern
+No GT labels needed at inference time. Edge classification + GNN forward pass
+takes ~100ms per garment (vs 40-60s for physics optimization).
 """
-import os
-import sys
-import json
-import pickle
-import argparse
+
+import os, sys, argparse, time
 import numpy as np
 import torch
 import trimesh
+
+from curvature_utils import compute_curvature, mesh_faces_to_edges
+from seam_detector import SeamDetector, predict_seams
+from unfold_net import PhysUnfolder, unfold_panels_fast
+from edge_detector import cut_mesh_into_panels
+from pipeline import (layout_panels_no_overlap, panel_boundary_convex,
+                      _load_gt_2d_panels, _parse_svg_panels, PANEL_COLORS,
+                      read_segmentation, normalize_label)
+from collections import Counter
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon as MplPolygon
-from shapely import MultiPoint, concave_hull
-from shapely.geometry import Polygon as ShapelyPolygon
-from scipy.spatial import cKDTree
-
-from model import NeuralTailorSeg
-from data_loader import read_segmentation, fps_sample
+from scipy.spatial import ConvexHull
 
 
-# ====================== Model loading ======================
+def extract_edge_features_infer(vertices_t, faces_t, curvature):
+    """Extract per-edge features (same as in generate_data.py)."""
+    N = vertices_t.shape[0]
+    all_edges = mesh_faces_to_edges(faces_t)
+    E = all_edges.shape[1]
+    src, tgt = all_edges[0], all_edges[1]
 
-def load_model(model_path, num_classes, feat_dim=128, global_dim=256, hidden_dim=256, k=16, device='cpu'):
-    model = NeuralTailorSeg(
-        num_classes=num_classes, feat_dim=feat_dim,
-        global_dim=global_dim, hidden_dim=hidden_dim, k=k
-    ).to(device)
+    H = curvature[:, 1]
+    K = curvature[:, 0]
+    disc = (H**2 - K).clamp(min=1e-10)
+    shape_idx = (2.0 / np.pi) * torch.atan(H / disc.sqrt())
 
-    ckpt = torch.load(model_path, map_location=device,weights_only=False)
-    if 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
-        print(f"Loaded checkpoint from epoch {ckpt.get('epoch', '?')}, val_acc={ckpt.get('val_acc', '?')}")
-    else:
-        model.load_state_dict(ckpt)
-    model.eval()
-    return model
+    v = vertices_t
+    edge_len = (v[src] - v[tgt]).norm(dim=-1)
+    mean_len = edge_len.mean().clamp(min=1e-8)
+    norm_len = edge_len / mean_len
+
+    # Dihedral angles
+    faces_arr = faces_t.cpu().numpy()
+    edge_to_faces = {}
+    for fi in range(faces_t.shape[0]):
+        a, b, c = int(faces_arr[fi, 0]), int(faces_arr[fi, 1]), int(faces_arr[fi, 2])
+        for e in [(min(a,b), max(a,b)), (min(b,c), max(b,c)), (min(c,a), max(c,a))]:
+            edge_to_faces.setdefault(e, []).append(fi)
+
+    v0 = v[faces_t[:, 0]]
+    v1 = v[faces_t[:, 1]]
+    v2 = v[faces_t[:, 2]]
+    cross = torch.cross(v1 - v0, v2 - v0, dim=-1)
+    face_normals = cross / cross.norm(dim=-1, keepdim=True).clamp(min=1e-10)
+
+    dihedral = torch.zeros(E)
+    for ei in range(E):
+        a, b = int(src[ei]), int(tgt[ei])
+        key = (min(a, b), max(a, b))
+        f_indices = edge_to_faces.get(key, [])
+        if len(f_indices) >= 2:
+            n1 = face_normals[f_indices[0]]
+            n2 = face_normals[f_indices[1]]
+            cos_val = (n1 * n2).sum().clamp(-1.0, 1.0)
+            dihedral[ei] = torch.acos(cos_val).abs().rad2deg() / 180.0
+
+    dH = (H[src] - H[tgt]).abs()
+    dK = (K[src] - K[tgt]).abs()
+    dShape = (shape_idx[src] - shape_idx[tgt]).abs()
+    dH = dH / max(dH.max().item(), 1e-6)
+    dK = dK / max(dK.max().item(), 1e-6)
+
+    feats = torch.stack([
+        dihedral, dH, dK, norm_len,
+        H[src].abs(), H[tgt].abs(),
+        K[src].abs(), K[tgt].abs(),
+        dShape,
+    ], dim=-1).float()
+
+    return feats, all_edges
 
 
-# ====================== Inference helpers ======================
+def infer_garment(ply_path, seam_model, unfold_model, device='cuda',
+                  out_dir='./output', threshold=0.5, visualize=True):
+    """Full inference pipeline on a single garment.
 
-@torch.no_grad()
-def predict_labels(model, vertices, num_points=4096, device='cpu'):
-    """Predict panel labels for all vertices of a mesh.
-
-    1. Sample num_points from mesh surface (or FPS from vertices)
-    2. Run model inference
-    3. Propagate labels back to all vertices via nearest-neighbor
+    Returns:
+        panels, unfolded_2d_results
     """
-    N = len(vertices)
+    t0 = time.time()
+    sample_name = os.path.basename(ply_path).replace('_sim.ply', '')
 
-    # Normalize vertices
-    centroid = vertices.mean(axis=0)
-    v_norm = vertices - centroid
-    max_dist = np.linalg.norm(v_norm, axis=1).max()
-    v_norm = v_norm / max(max_dist, 1e-8)
-
-    # Sample points for inference
-    if N > num_points:
-        # FPS on normalized vertices
-        idx = fps_sample(v_norm, num_points)
-        pts = v_norm[idx]
-        sample_idx = idx
-    else:
-        pts = v_norm
-        sample_idx = np.arange(N)
-
-    # Model inference
-    pts_tensor = torch.tensor(pts, dtype=torch.float32).unsqueeze(0).to(device)  # (1, S, 3)
-    seg_logits = model(pts_tensor)  # (1, S, C)
-    pred_sample = seg_logits.squeeze(0).argmax(dim=-1).cpu().numpy()  # (S,)
-
-    # Propagate labels to all vertices via nearest-neighbor
-    if N > num_points:
-        tree = cKDTree(v_norm[sample_idx])
-        _, nn_idx = tree.query(v_norm)
-        pred_all = pred_sample[nn_idx]
-    else:
-        pred_all = pred_sample
-
-    return pred_all.astype(np.int64)
-
-
-# ====================== 2D Panel Extraction ======================
-
-def rotation_matrix_3d(rx, ry, rz):
-    """Build 3D rotation matrix (X→Y→Z Euler angles)."""
-    rx, ry, rz = np.radians([rx, ry, rz])
-    cx, sx = np.cos(rx), np.sin(rx)
-    cy, sy = np.cos(ry), np.sin(ry)
-    cz, sz = np.cos(rz), np.sin(rz)
-    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
-    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
-    return Rz @ Ry @ Rx
-
-
-def project_to_panel_2d(points_3d, panel_data):
-    """Inverse-transform 3D points to panel local 2D coordinates."""
-    translation = np.array(panel_data['translation'], dtype=float)
-    rotation = np.array(panel_data['rotation'], dtype=float)
-    pts = points_3d - translation
-    R = rotation_matrix_3d(*rotation)
-    R_inv = R.T
-    pts = pts @ R_inv.T
-    return pts[:, :2]
-
-
-def compute_panel_boundary(points_2d, ratio=0.2, min_points=10):
-    """Extract smooth panel boundary using concave hull."""
-    pts = np.unique(points_2d.round(decimals=4), axis=0)
-    if len(pts) < min_points:
-        return None
-    try:
-        mp = MultiPoint(pts)
-        hull = concave_hull(mp, ratio=ratio)
-        if hull is None or hull.is_empty:
-            return None
-        if isinstance(hull, ShapelyPolygon):
-            boundary = np.array(hull.exterior.coords)
-        else:
-            boundary = np.array(hull.coords)
-        if len(boundary) >= 3:
-            return boundary[:, :2]
-    except Exception:
-        pass
-    return None
-
-
-def layout_panels_grid(panel_boundaries, margin=30.0):
-    """Layout panels in a grid to avoid overlap."""
-    names = list(panel_boundaries.keys())
-    if not names:
-        return panel_boundaries
-
-    # Pair left/right panels
-    paired_set = set()
-    pairs, singles = [], []
-    for name in sorted(names):
-        if name in paired_set:
-            continue
-        other = None
-        if name.startswith('left_'):
-            other = 'right_' + name[5:]
-        elif name.startswith('right_'):
-            other = 'left_' + name[6:]
-        if other and other in panel_boundaries:
-            paired_set.add(name)
-            paired_set.add(other)
-            pairs.append((name, other))
-        else:
-            singles.append(name)
-
-    items = [(p[0], p[1], True) for p in pairs] + [(s, None, False) for s in sorted(singles)]
-    n = len(items)
-    if n == 0:
-        return panel_boundaries
-
-    def pw(name):
-        p = panel_boundaries[name]
-        return p[:, 0].max() - p[:, 0].min()
-
-    def ph(name):
-        p = panel_boundaries[name]
-        return p[:, 1].max() - p[:, 1].min()
-
-    def item_w(item):
-        w = pw(item[0])
-        if item[2]:
-            w += pw(item[1]) + margin
-        return w
-
-    def item_h(item):
-        h = ph(item[0])
-        if item[2]:
-            h = max(h, ph(item[1]))
-        return h
-
-    items.sort(key=lambda x: -item_w(x))
-    cols = max(2, int(np.ceil(np.sqrt(n))))
-    rows = int(np.ceil(n / cols))
-
-    col_w = [0.0] * cols
-    row_h = [0.0] * rows
-    for i, item in enumerate(items):
-        r, c = i // cols, i % cols
-        col_w[c] = max(col_w[c], item_w(item))
-        row_h[r] = max(row_h[r], item_h(item))
-
-    x_cum = [0.0]
-    for w in col_w:
-        x_cum.append(x_cum[-1] + w + margin)
-    y_cum = [0.0]
-    for h in row_h:
-        y_cum.append(y_cum[-1] + h + margin)
-
-    new_boundaries = {}
-    for i, item in enumerate(items):
-        r, c = i // cols, i % cols
-        dx = x_cum[c]
-        dy = y_cum[r]
-        if item[2]:
-            l_n, r_n = item[0], item[1]
-            l_p = panel_boundaries[l_n].copy()
-            r_p = panel_boundaries[r_n].copy()
-            new_boundaries[l_n] = l_p + [dx - l_p[:, 0].min(), dy - l_p[:, 1].min()]
-            new_boundaries[r_n] = r_p + [dx + pw(l_n) + margin - r_p[:, 0].min(), dy - r_p[:, 1].min()]
-        else:
-            s_n = item[0]
-            s_p = panel_boundaries[s_n].copy()
-            new_boundaries[s_n] = s_p + [dx - s_p[:, 0].min(), dy - s_p[:, 1].min()]
-    return new_boundaries
-
-
-# ====================== Visualization ======================
-
-PANEL_COLORS = [
-    '#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4',
-    '#42d4f4', '#f032e6', '#bfef45', '#fabebe', '#469990', '#e6beff',
-    '#9a6324', '#fffac8', '#800000', '#aaffc3', '#808000', '#ffd8b1',
-    '#000075', '#a9a9a9', '#dcbeff', '#a9f1e0', '#ff7f50', '#00ffff',
-    '#ff00ff', '#008080', '#b8860b', '#006400', '#adff2f', '#ff1493',
-    '#7b68ee', '#00fa9a', '#d2691e', '#ff6347', '#8a2be2', '#5f9ea0',
-    '#da70d6', '#cd853f', '#bc8f8f', '#4169e1', '#2e8b57', '#6a5acd',
-]
-
-
-def save_3d_segmentation(vertices, faces, pred_labels, id_to_part, save_path):
-    """Save 3D mesh colored by predicted panel labels as PLY file."""
-    colors = np.zeros((len(vertices), 3), dtype=np.uint8)
-    unique_labels = np.unique(pred_labels)
-    for lbl in unique_labels:
-        mask = pred_labels == lbl
-        color_hex = PANEL_COLORS[lbl % len(PANEL_COLORS)]
-        r, g, b = int(color_hex[1:3], 16), int(color_hex[3:5], 16), int(color_hex[5:7], 16)
-        colors[mask] = [r, g, b]
-
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_colors=colors, process=False)
-    mesh.export(save_path)
-    print(f"  3D 分割结果 → {save_path}")
-
-
-def save_pred_vs_gt(vertices, faces, pred_labels, gt_labels, id_to_part, save_path):
-    """Side-by-side comparison of predicted vs ground truth segmentation on 3D mesh."""
-    _, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-
-    for ax, labels, title in [(ax1, pred_labels, 'Prediction'), (ax2, gt_labels, 'Ground Truth')]:
-        colors = np.zeros((len(vertices), 3), dtype=np.uint8)
-        unique_labels = np.unique(labels)
-        for lbl in unique_labels:
-            mask = labels == lbl
-            color_hex = PANEL_COLORS[lbl % len(PANEL_COLORS)]
-            r, g, b = int(color_hex[1:3], 16), int(color_hex[3:5], 16), int(color_hex[5:7], 16)
-            colors[mask] = [r, g, b]
-        ax.scatter(vertices[::10, 0], vertices[::10, 2], c=colors[::10] / 255.0, s=0.5, alpha=0.8)
-        ax.set_title(title, fontsize=12, fontweight='bold')
-        ax.set_aspect('equal')
-        ax.axis('off')
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  分割对比 → {save_path}")
-
-
-def save_panel_layout(panel_boundaries, save_path):
-    """Save 2D panel layout as an image."""
-    if not panel_boundaries:
-        print("  没有有效面板边界")
-        return
-
-    panel_boundaries = layout_panels_grid(panel_boundaries, margin=30.0)
-
-    all_x = np.concatenate([p[:, 0] for p in panel_boundaries.values()])
-    all_y = np.concatenate([p[:, 1] for p in panel_boundaries.values()])
-    w, h = all_x.max() - all_x.min(), all_y.max() - all_y.min()
-    x_mid, y_mid = (all_x.max() + all_x.min()) / 2, (all_y.max() + all_y.min()) / 2
-
-    pad = 0.08
-    canvas_w, canvas_h = w * (1 + pad), h * (1 + pad)
-
-    target_dpi = 150
-    target_px = 800
-    scale = max(canvas_w, canvas_h) * target_dpi / target_px
-    fig_w, fig_h = canvas_w / scale, canvas_h / scale
-
-    _, ax = plt.subplots(figsize=(fig_w, fig_h))
-    for i, (name, pts) in enumerate(panel_boundaries.items()):
-        color = PANEL_COLORS[i % len(PANEL_COLORS)]
-        ax.add_patch(MplPolygon(pts, facecolor=color, edgecolor='#111111',
-                                 linewidth=0.5, alpha=0.85))
-        center = np.mean(pts, axis=0)
-        ax.text(center[0], center[1], name.replace('_', '\n'), ha='center',
-                va='center', fontsize=5, color='#222222')
-
-    ax.set_xlim(x_mid - canvas_w / 2, x_mid + canvas_w / 2)
-    ax.set_ylim(y_mid - canvas_h / 2, y_mid + canvas_h / 2)
-    ax.set_aspect('equal')
-    ax.axis('off')
-    plt.savefig(save_path, dpi=target_dpi, bbox_inches='tight')
-    plt.close()
-    print(f"  2D 面板布局 → {save_path}")
-
-
-def save_comparison_with_gt(gt_pattern_path, panel_boundaries, save_path):
-    """GT pattern image vs predicted panel layout side by side."""
-    if not os.path.exists(gt_pattern_path):
-        return
-
-    gt_img = plt.imread(gt_pattern_path)
-
-    _, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(16, 7))
-
-    ax_l.imshow(gt_img)
-    ax_l.set_title('Ground Truth Pattern', fontsize=12, fontweight='bold')
-    ax_l.axis('off')
-
-    if panel_boundaries:
-        panel_boundaries = layout_panels_grid(panel_boundaries, margin=25.0)
-        all_x = np.concatenate([p[:, 0] for p in panel_boundaries.values()])
-        all_y = np.concatenate([p[:, 1] for p in panel_boundaries.values()])
-        x_mid, y_mid = (all_x.max() + all_x.min()) / 2, (all_y.max() + all_y.min()) / 2
-        w, h = all_x.max() - all_x.min(), all_y.max() - all_y.min()
-        pad = 0.1
-        half_w, half_h = w * (1 + pad) / 2, h * (1 + pad) / 2
-        half_w = max(half_w, half_h)  # force square-ish
-
-        for i, (name, pts) in enumerate(panel_boundaries.items()):
-            color = PANEL_COLORS[i % len(PANEL_COLORS)]
-            ax_r.add_patch(MplPolygon(pts, facecolor=color, edgecolor='#111111',
-                                       linewidth=0.5, alpha=0.85))
-            center = np.mean(pts, axis=0)
-            ax_r.text(center[0], center[1], name.replace('_', '\n'), ha='center',
-                      va='center', fontsize=4.5, color='#222222')
-
-        ax_r.set_xlim(x_mid - half_w, x_mid + half_w)
-        ax_r.set_ylim(y_mid - half_w, y_mid + half_w)
-        ax_r.set_aspect('equal')
-
-    ax_r.set_title('Predicted Panels (NeuralTailor)', fontsize=12, fontweight='bold')
-    ax_r.axis('off')
-
-    plt.tight_layout(pad=2.0)
-    plt.savefig(save_path, dpi=150, bbox_inches='tight', pad_inches=0.2)
-    plt.close()
-    print(f"  GT对比 → {save_path}")
-
-
-# ====================== Main inference ======================
-
-def infer_sample(model, sample_dir, output_dir, id_to_part, num_classes,
-                 num_points=4096, device='gpu', id_to_part_map=None):
-    """Run inference on a single sample."""
-    sample_name = os.path.basename(sample_dir.rstrip('/'))
-    ply_path = os.path.join(sample_dir, f'{sample_name}_sim.ply')
-    seg_path = os.path.join(sample_dir, f'{sample_name}_sim_segmentation.txt')
-    spec_path = os.path.join(sample_dir, f'{sample_name}_specification.json')
-
-    if not os.path.exists(ply_path):
-        print(f"  跳过 {sample_name}: 缺少 PLY")
-        return
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load mesh
+    # 1. Load mesh
     mesh = trimesh.load(ply_path, process=False)
     vertices = np.array(mesh.vertices, dtype=np.float32)
-    faces = np.array(mesh.faces, dtype=np.int32)
+    faces = np.array(mesh.faces, dtype=np.int64)
 
-    # Load ground truth labels
-    gt_labels = read_segmentation(seg_path, len(vertices), faces)
-    gt_label_ids = np.zeros(len(vertices), dtype=np.int64)
-    for i, lbl in enumerate(gt_labels):
-        gt_label_ids[i] = id_to_part_map.get(lbl, 0)
+    verts_t = torch.from_numpy(vertices).float()
+    faces_t = torch.from_numpy(faces).long()
 
-    # Predict
-    pred_labels = predict_labels(model, vertices, num_points, device)
+    # 2. Extract edge features
+    curv = compute_curvature(verts_t, faces_t)
+    edge_feats, all_edges = extract_edge_features_infer(verts_t, faces_t, curv)
 
-    # 3D segmentation visualization
-    save_3d_segmentation(vertices, faces, pred_labels, id_to_part,
-                         os.path.join(output_dir, f'{sample_name}_seg3d.ply'))
-    save_pred_vs_gt(vertices, faces, pred_labels, gt_label_ids, id_to_part,
-                    os.path.join(output_dir, f'{sample_name}_seg_compare.png'))
+    # 3. Seam detection (ML inference)
+    seam_mask, seam_probs = predict_seams(seam_model, edge_feats, threshold, device)
+    seam_mask_cpu = seam_mask.cpu()
+    seam_edges = all_edges[:, seam_mask_cpu]
+    panel_edges = all_edges[:, ~seam_mask_cpu]
+    print(f"  Seam edges: {seam_edges.shape[1]} / {all_edges.shape[1]} "
+          f"({100*seam_mask.float().mean():.1f}%)")
 
-    # 2D panel extraction
-    if os.path.exists(spec_path):
-        with open(spec_path, 'r') as f:
-            spec = json.load(f)
-        panels = spec['pattern']['panels']
+    # 4. Cut into panels
+    panels = cut_mesh_into_panels(verts_t, faces_t, panel_edges)
+    panels = [p for p in panels if p['vertices'].shape[0] >= 30 and p['faces'].shape[0] >= 1]
+    print(f"  Panels: {len(panels)}")
 
-        # Undo normalization
-        centroid = vertices.mean(axis=0)
-        v_centered = vertices - centroid
-        max_dist = np.linalg.norm(v_centered, axis=1).max()
+    # 5. Unfold each panel (ML inference — milliseconds)
+    results_2d = unfold_panels_fast(unfold_model, panels, device)
 
-        # Extract panel boundaries
-        panel_boundaries = {}
-        for panel_name in panels:
-            panel_id = id_to_part_map.get(panel_name, -1)
-            if panel_id < 0:
-                continue
-            mask = pred_labels == panel_id
-            if mask.sum() < 20:
-                continue
+    dt = time.time() - t0
+    print(f"  Inference time: {dt*1000:.0f}ms")
 
-            # Project to 2D using spec
-            panel_verts_3d = vertices[mask]
-            # Move back to original scale
-            panel_verts_orig = panel_verts_3d * max(max_dist, 1e-8) + centroid
+    # 6. Visualization
+    if visualize and len(panels) > 0:
+        os.makedirs(out_dir, exist_ok=True)
+        n_panels = len(panels)
+        layout = layout_panels_no_overlap(
+            [{'u_2d': u} for u in results_2d])
 
+        # ===== Comparison image: GT layout vs ML layout =====
+        spec_path = os.path.join(os.path.dirname(ply_path),
+                                 f'{sample_name}_specification.json')
+        gt_panels = _load_gt_2d_panels(spec_path) if os.path.exists(spec_path) else {}
+
+        # Match panel names to GT
+        seg_path = os.path.join(os.path.dirname(ply_path),
+                                f'{sample_name}_sim_segmentation.txt')
+        panel_names = [f'P{idx+1}' for idx in range(n_panels)]
+        if os.path.exists(seg_path):
+            N_mesh = len(trimesh.load(ply_path, process=False).vertices)
+            faces_mesh = trimesh.load(ply_path, process=False).faces
+            gt_labels = read_segmentation(seg_path, N_mesh, np.array(faces_mesh, dtype=np.int64))
+            unique_lbls = sorted(set(l for l in gt_labels if l != 'unlabeled' and not l.startswith('stitch')))
+            part_to_id = {lbl: i+1 for i,lbl in enumerate(unique_lbls)}
+            id_to_part = {i+1: lbl for i,lbl in enumerate(unique_lbls)}
+            vertex_ids = np.array([part_to_id.get(l,0) for l in gt_labels], dtype=np.int64)
+            for pi, p in enumerate(panels):
+                gidx = p['global_indices'].numpy()
+                counts = Counter(l for l in vertex_ids[gidx] if l > 0)
+                if counts:
+                    panel_names[pi] = id_to_part.get(counts.most_common(1)[0][0], '?')
+
+        fig_comp, (ax_gt, ax_ml) = plt.subplots(1, 2, figsize=(20, 12))
+
+        # Left: GT — Y already flipped in _load_gt_2d_panels
+        if gt_panels:
+            for idx, (pname, pts) in enumerate(gt_panels.items()):
+                color = PANEL_COLORS[idx % len(PANEL_COLORS)]
+                ax_gt.fill(pts[:, 0], pts[:, 1], color=color, alpha=0.5,
+                          edgecolor='black', linewidth=0.5)
+        ax_gt.set_aspect('equal')
+        ax_gt.set_title(f'GT LAYOUT — {sample_name}', fontsize=14, fontweight='bold',
+                       color='steelblue')
+        ax_gt.axis('off')
+
+        # Right: ML unfolding — grid layout
+        from scipy.spatial import ConvexHull as CHull
+        n_cols = int(np.ceil(np.sqrt(n_panels)))
+        # Compute reasonable cell size even if panels are degenerate
+        extents = [np.ptp(results_2d[i], axis=0) for i in range(n_panels) if len(results_2d[i]) > 0]
+        cell_w = max(1.0, max(e[0] for e in extents) if extents else 1.0) + 20
+        cell_h = max(1.0, max(e[1] for e in extents) if extents else 1.0) + 20
+        for idx in range(n_panels):
+            u = results_2d[idx] - results_2d[idx].mean(axis=0)
+            row_i, col_i = idx // n_cols, idx % n_cols
+            u = u + np.array([col_i * cell_w, row_i * cell_h])
+            color = PANEL_COLORS[idx % len(PANEL_COLORS)]
             try:
-                panel_2d = project_to_panel_2d(panel_verts_orig, panels[panel_name])
-                boundary = compute_panel_boundary(panel_2d, ratio=0.25)
-                if boundary is not None:
-                    # Map to spec's 2D space (panels in spec have their own coordinate system)
-                    panel_boundaries[panel_name] = boundary
-            except Exception:
+                h = CHull(u)
+                ax_ml.fill(u[h.vertices,0], u[h.vertices,1], color=color, alpha=0.4,
+                          edgecolor='black', linewidth=1)
+            except:
                 pass
+            ax_ml.scatter(u[:,0], u[:,1], s=8, c=color, alpha=0.5)  # always visible
+        ax_ml.set_aspect('equal')
+        ax_ml.set_title(f'ML UNFOLDING — {n_panels} panels ({dt*1000:.0f}ms)',
+                       fontsize=14, fontweight='bold', color='darkred')
+        ax_ml.axis('off')
 
-        # Save panel layout
-        save_panel_layout(panel_boundaries,
-                          os.path.join(output_dir, f'{sample_name}_panels.png'))
+        fig_comp.tight_layout()
+        fig_comp.savefig(os.path.join(out_dir, f'{sample_name}_comparison.png'), dpi=150)
+        plt.close(fig_comp)
 
-        # GT comparison
-        gt_pattern = os.path.join(sample_dir, f'{sample_name}_pattern.png')
-        if os.path.exists(gt_pattern):
-            save_comparison_with_gt(gt_pattern, panel_boundaries,
-                                    os.path.join(output_dir, f'{sample_name}_comparison.png'))
+        # ===== Detailed view: individual GT + ML panels =====
+        # Show ALL panels from both sides regardless of name matching
+        gt_name_list = sorted(gt_panels.keys()) if gt_panels else []
+        n_gt = len(gt_name_list)
+        n_ml = n_panels
+        n_rows = max(n_gt, n_ml) + 1  # +1 for header
 
-    print(f"  {sample_name}: {len(panel_boundaries) if 'panel_boundaries' in dir() else 0} 面板 → {output_dir}")
+        fig = plt.figure(figsize=(12, n_rows * 3.5))
+        gs = fig.add_gridspec(n_rows, 2, hspace=0.3, wspace=0.3)
+
+        # Headers
+        for col, title, color in [(0, 'GT PANELS', 'steelblue'), (1, 'ML UNFOLDING', 'darkred')]:
+            ax = fig.add_subplot(gs[0, col])
+            ax.text(0.5, 0.5, title, ha='center', va='center', fontsize=12, fontweight='bold', color=color)
+            ax.axis('off')
+
+        from scipy.spatial import ConvexHull as CH2
+        for row_idx in range(max(n_gt, n_ml)):
+            # GT (left) — show by index, not by name match
+            ax_gt_row = fig.add_subplot(gs[row_idx+1, 0])
+            if row_idx < n_gt:
+                pname = gt_name_list[row_idx]
+                pts = gt_panels[pname]
+                ax_gt_row.fill(pts[:,0], pts[:,1], color='steelblue', alpha=0.3, edgecolor='steelblue', linewidth=1)
+                ax_gt_row.set_title(f'GT: {pname[:22]}', fontsize=7, color='steelblue')
+            ax_gt_row.set_aspect('equal'); ax_gt_row.axis('off')
+
+            # ML (right) — show all panels regardless of name match
+            ax_ml_row = fig.add_subplot(gs[row_idx+1, 1])
+            if row_idx < n_ml:
+                u = results_2d[row_idx] - results_2d[row_idx].mean(axis=0)
+                pname = panel_names[row_idx]
+                color = PANEL_COLORS[row_idx % len(PANEL_COLORS)]
+                try:
+                    h = CH2(u)
+                    ax_ml_row.fill(u[h.vertices,0], u[h.vertices,1], color=color, alpha=0.4, edgecolor='black', linewidth=1)
+                except:
+                    pass
+                ax_ml_row.scatter(u[:,0], u[:,1], s=8, c=color, alpha=0.6)  # always show points
+                ax_ml_row.set_title(f'ML: {pname[:22]} ({len(u)}v)', fontsize=7, color='darkred')
+            ax_ml_row.set_aspect('equal'); ax_ml_row.axis('off')
+
+        fig.suptitle(sample_name, fontsize=14)
+        fig.savefig(os.path.join(out_dir, f'{sample_name}_panels.png'), dpi=150)
+        plt.close(fig)
+        print(f"  Comparison → {out_dir}/{sample_name}_comparison.png")
+        print(f"  Panels    → {out_dir}/{sample_name}_panels.png")
+
+    return panels, results_2d
 
 
 def main():
-    parser = argparse.ArgumentParser(description='NeuralTailor 面板分割推理')
-    parser.add_argument('--model', default='./models/best_model.pth')
-    parser.add_argument('--part_to_id', default='../GarmentCodeData/GarmentCodeData_v2/part_to_id.npy')
-    parser.add_argument('--sample_dir', default=None)
-    parser.add_argument('--data_root', default='../GarmentCodeData/GarmentCodeData_v2')
-    parser.add_argument('--garment_folder', default='garments_5000_0')
-    parser.add_argument('--body_type', default='default_body')
-    parser.add_argument('--output_root', default='./results')
+    parser = argparse.ArgumentParser(description='Fast ML inference for panel unfolding')
+    parser.add_argument('--ply', help='Single PLY file')
+    parser.add_argument('--batch', action='store_true')
+    parser.add_argument('--data_root', default='/home/ddd/zkl/GarmentCodeData/GarmentCodeData_v2')
     parser.add_argument('--max_samples', type=int, default=5)
-    parser.add_argument('--num_points', type=int, default=4096)
-    parser.add_argument('--feat_dim', type=int, default=128)
-    parser.add_argument('--global_dim', type=int, default=256)
-    parser.add_argument('--hidden_dim', type=int, default=256)
-    parser.add_argument('--k', type=int, default=16)
+    parser.add_argument('--out_dir', default='./output')
+    parser.add_argument('--seam_model', default='./models/seam_detector.pth')
+    parser.add_argument('--unfold_model', default='./models/unfold_net.pth')
+    parser.add_argument('--threshold', type=float, default=0.5)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    print(f"设备: {device}")
 
-    # Load class mapping
-    pkl_path = args.part_to_id.replace('.npy', '.pkl')
-    if os.path.exists(pkl_path):
-        with open(pkl_path, 'rb') as f:
-            part_to_id = pickle.load(f)
+    # Load models
+    seam_model = SeamDetector().to(device)
+    sd = torch.load(args.seam_model, map_location=device)
+    if isinstance(sd, dict) and 'model_state' in sd:
+        sd = sd['model_state']
+    seam_model.load_state_dict(sd)
+    seam_model.eval()
+    print(f"Seam detector loaded: {args.seam_model}")
+
+    unfold_model = PhysUnfolder().to(device)
+    sd = torch.load(args.unfold_model, map_location=device)
+    if isinstance(sd, dict) and 'model_state' in sd:
+        sd = sd['model_state']
+    unfold_model.load_state_dict(sd)
+    unfold_model.eval()
+    print(f"Unfold net loaded: {args.unfold_model}")
+
+    if args.batch:
+        data_dir = os.path.join(args.data_root, 'garments_5000_0', 'default_body')
+        samples = [d for d in sorted(os.listdir(data_dir))
+                   if d.startswith('rand_') and os.path.isdir(os.path.join(data_dir, d))]
+        samples = samples[:args.max_samples]
+        for name in samples:
+            ply = os.path.join(data_dir, name, f'{name}_sim.ply')
+            if not os.path.exists(ply):
+                continue
+            print(f"\n{'='*50}")
+            print(f"{name}")
+            print(f"{'='*50}")
+            try:
+                infer_garment(ply, seam_model, unfold_model, device,
+                             args.out_dir, args.threshold)
+            except Exception as e:
+                print(f"  Error: {e}")
     else:
-        part_to_id = np.load(args.part_to_id, allow_pickle=True).item()
-    id_to_part = {v: k for k, v in part_to_id.items()}
-    num_classes = len(part_to_id)
-    print(f"面板类别数: {num_classes}")
-
-    # Load model
-    model = load_model(args.model, num_classes=num_classes,
-                       feat_dim=args.feat_dim, global_dim=args.global_dim,
-                       hidden_dim=args.hidden_dim, k=args.k, device=device)
-
-    # Run inference
-    if args.sample_dir:
-        sample_name = os.path.basename(args.sample_dir.rstrip('/'))
-        output_dir = os.path.join(args.output_root, sample_name)
-        infer_sample(model, args.sample_dir, output_dir, id_to_part,
-                     num_classes, args.num_points, device, part_to_id)
-    else:
-        body_dir = os.path.join(args.data_root, args.garment_folder, args.body_type)
-        sample_dirs = sorted([
-            d for d in os.listdir(body_dir)
-            if os.path.isdir(os.path.join(body_dir, d)) and d.startswith('rand_')
-        ])
-        for sd in sample_dirs[:args.max_samples]:
-            sample_path = os.path.join(body_dir, sd)
-            output_dir = os.path.join(args.output_root, sd)
-            infer_sample(model, sample_path, output_dir, id_to_part,
-                         num_classes, args.num_points, device, part_to_id)
-
-    print("推理完成!")
+        if not args.ply:
+            print("Specify --ply or --batch")
+            return
+        infer_garment(args.ply, seam_model, unfold_model, device,
+                     args.out_dir, args.threshold)
 
 
 if __name__ == '__main__':
